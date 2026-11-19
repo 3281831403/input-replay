@@ -6,8 +6,8 @@ rate.  Events have the shape::
 
     {"t": int, "type": str, "payload": dict}
 
-The functions in this module are deliberately left as stubs: every public
-entry point raises ``NotImplementedError`` until the replay pipeline is fixed.
+Every public entry point is deterministic: no randomness, no wall-clock time,
+and no dependence on dict insertion order.
 """
 
 from __future__ import annotations
@@ -20,9 +20,61 @@ from bisect import bisect_left, bisect_right
 MAX_EVENTS = 10_000
 DEVICE_SWITCH = "device_switch"
 
+_JSON_KWARGS = {
+    "sort_keys": True,
+    "separators": (",", ":"),
+    "ensure_ascii": False,
+}
+
 
 class ReplayError(Exception):
     """Raised when a recording does not satisfy the replay contract."""
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _validate_frame_times(frame_times, *, require_any=True):
+    """Validate and return a copied list of strictly increasing frame times."""
+    if not isinstance(frame_times, (list, tuple)):
+        raise ReplayError("frame_times must be a list of integers")
+    frames = list(frame_times)
+    if require_any and not frames:
+        raise ReplayError("frame_times must contain at least one frame")
+    previous = None
+    for frame_time in frames:
+        if not _is_int(frame_time):
+            raise ReplayError("frame times must be integers")
+        if previous is not None and frame_time <= previous:
+            raise ReplayError("frame_times must be strictly increasing")
+        previous = frame_time
+    return frames
+
+
+def _canonical(value):
+    """Canonical JSON used for stable comparison and ordering."""
+    return json.dumps(value, **_JSON_KWARGS)
+
+
+def _copy_event(event, *, copy_payload=True):
+    copied = dict(event)
+    if copy_payload and isinstance(copied.get("payload"), dict):
+        copied["payload"] = dict(copied["payload"])
+    return copied
+
+
+def _event_frame_bounds(event, frame_count):
+    frame = event.get("frame")
+    if not _is_int(frame):
+        raise ReplayError("event is missing an integer 'frame'")
+    if frame < 0 or frame >= frame_count:
+        raise ReplayError(f"event frame {frame} is outside the frame grid")
+    return frame
 
 
 def record(events, frame_times):
@@ -52,7 +104,49 @@ def record(events, frame_times):
     first ``MAX_EVENTS`` events and set ``truncated`` to ``True`` so memory is
     bounded.  The input objects are not mutated.
     """
-    raise NotImplementedError("record() is not implemented")
+    frames = _validate_frame_times(frame_times)
+    if not isinstance(events, (list, tuple)):
+        raise ReplayError("events must be a list of event mappings")
+
+    last_frame = len(frames) - 1
+    archived = []
+    truncated = False
+    previous_t = None
+
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            raise ReplayError("each event must be a mapping")
+        t = event.get("t")
+        if not _is_int(t):
+            raise ReplayError("event 't' must be an integer")
+        event_type = event.get("type")
+        if not isinstance(event_type, str):
+            raise ReplayError("event 'type' must be a string")
+        if not isinstance(event.get("payload"), dict):
+            raise ReplayError("event 'payload' must be a mapping")
+        if previous_t is not None and t < previous_t:
+            raise ReplayError("event timestamps must not go backwards")
+        previous_t = t
+
+        if index >= MAX_EVENTS:
+            truncated = True
+            continue
+
+        frame = bisect_right(frames, t) - 1
+        if frame < 0:
+            frame = 0
+        elif frame > last_frame:
+            frame = last_frame
+
+        copied = _copy_event(event)
+        copied["frame"] = frame
+        archived.append(copied)
+
+    return {
+        "frame_times": frames,
+        "events": archived,
+        "truncated": truncated,
+    }
 
 
 def align_to_frames(events, frame_times, tolerance):
@@ -73,7 +167,45 @@ def align_to_frames(events, frame_times, tolerance):
     The input events are not modified.  Invalid frame lists or tolerances raise
     :class:`ReplayError`.
     """
-    raise NotImplementedError("align_to_frames() is not implemented")
+    if not _is_number(tolerance) or not math.isfinite(tolerance):
+        raise ReplayError("tolerance must be a finite number")
+    if tolerance < 0:
+        raise ReplayError("tolerance must be non-negative")
+    frames = _validate_frame_times(frame_times, require_any=False)
+    if not isinstance(events, (list, tuple)):
+        raise ReplayError("events must be a list of event mappings")
+    if not frames and events:
+        raise ReplayError("frame_times must contain at least one frame")
+
+    aligned = []
+    for event in events:
+        if not isinstance(event, dict):
+            raise ReplayError("each event must be a mapping")
+        t = event.get("t")
+        if not _is_int(t):
+            raise ReplayError("event 't' must be an integer")
+
+        position = bisect_left(frames, t)
+        if position <= 0:
+            frame = 0
+        elif position >= len(frames):
+            frame = len(frames) - 1
+        else:
+            before = frames[position - 1]
+            after = frames[position]
+            # A tie between neighbours goes to the later frame.
+            frame = position if (after - t) <= (t - before) else position - 1
+
+        delta_ms = t - frames[frame]
+        if abs(delta_ms) > tolerance:
+            continue
+
+        copied = _copy_event(event)
+        copied["frame"] = frame
+        copied["delta_ms"] = delta_ms
+        aligned.append(copied)
+
+    return aligned
 
 
 def dedupe(events):
@@ -90,7 +222,36 @@ def dedupe(events):
     break the replay duration.  The input list is not modified.  Missing
     ``frame``/``type`` fields raise :class:`ReplayError`.
     """
-    raise NotImplementedError("dedupe() is not implemented")
+    if not isinstance(events, (list, tuple)):
+        raise ReplayError("events must be a list of event mappings")
+
+    group_keys = []
+    last_index = {}
+
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            raise ReplayError("each event must be a mapping")
+        frame = event.get("frame")
+        if not _is_int(frame):
+            raise ReplayError("event is missing an integer 'frame'")
+        event_type = event.get("type")
+        if not isinstance(event_type, str):
+            raise ReplayError("event is missing a string 'type'")
+
+        payload = event.get("payload")
+        if isinstance(payload, dict) and "key" in payload:
+            key = (frame, event_type, _canonical(payload["key"]))
+            last_index[key] = index
+        else:
+            key = None
+        group_keys.append(key)
+
+    kept = []
+    for index, event in enumerate(events):
+        key = group_keys[index]
+        if key is None or last_index[key] == index:
+            kept.append(event)
+    return kept
 
 
 def apply_deadzone(axis, deadzone, sensitivity):
@@ -112,7 +273,27 @@ def apply_deadzone(axis, deadzone, sensitivity):
     sensitivity, a non-finite input, or an out-of-range axis raises
     :class:`ReplayError`.
     """
-    raise NotImplementedError("apply_deadzone() is not implemented")
+    if not _is_number(axis) or not math.isfinite(axis):
+        raise ReplayError("axis must be a finite number")
+    if not _is_number(deadzone) or not math.isfinite(deadzone):
+        raise ReplayError("deadzone must be a finite number")
+    if not _is_number(sensitivity) or not math.isfinite(sensitivity):
+        raise ReplayError("sensitivity must be a finite number")
+    if deadzone < 0.0 or deadzone >= 1.0:
+        raise ReplayError("deadzone must be in [0.0, 1.0)")
+    if sensitivity < 0.0:
+        raise ReplayError("sensitivity must be non-negative")
+    if axis < -1.0 or axis > 1.0:
+        raise ReplayError("axis must be in [-1.0, 1.0]")
+
+    magnitude = abs(axis)
+    if magnitude <= deadzone:
+        return 0.0
+
+    normalized = (magnitude - deadzone) / (1.0 - deadzone) * sensitivity
+    if axis < 0.0:
+        return -normalized
+    return normalized
 
 
 def switch_device(track, device_id):
@@ -136,7 +317,44 @@ def switch_device(track, device_id):
     Replay uses this boundary to segment the stream: events before it use the
     old device state and events after it use the new device state.
     """
-    raise NotImplementedError("switch_device() is not implemented")
+    if not isinstance(track, dict):
+        raise ReplayError("track must be a mapping")
+
+    switched = dict(track)
+    events = list(track.get("events") or [])
+    copied_events = [_copy_event(event) for event in events]
+
+    if events:
+        last = events[-1]
+        if not _is_int(last.get("t")):
+            raise ReplayError("last event is missing an integer 't'")
+        boundary_t = last["t"] + 1
+        boundary_frame = last.get("frame", 0)
+        if not _is_int(boundary_frame):
+            raise ReplayError("last event is missing an integer 'frame'")
+    else:
+        frames = list(track.get("frame_times") or [])
+        if frames:
+            boundary_t = frames[-1]
+            boundary_frame = len(frames) - 1
+        else:
+            boundary_t = 0
+            boundary_frame = 0
+
+    boundary = {
+        "t": boundary_t,
+        "type": DEVICE_SWITCH,
+        "payload": {
+            "device_id": device_id,
+            "from": track.get("device"),
+        },
+        "frame": boundary_frame,
+    }
+    copied_events.append(boundary)
+
+    switched["events"] = copied_events
+    switched["device"] = device_id
+    return switched
 
 
 def checksum(track):
@@ -154,7 +372,18 @@ def checksum(track):
     (``sort_keys=True``, compact separators, ``ensure_ascii=False``) that
     includes the whole track, not only the event payloads.
     """
-    raise NotImplementedError("checksum() is not implemented")
+    if not isinstance(track, dict):
+        raise ReplayError("track must be a mapping")
+
+    canonical_track = dict(track)
+    if "events" in canonical_track:
+        events = canonical_track["events"]
+        if not isinstance(events, (list, tuple)):
+            raise ReplayError("track events must be a list")
+        canonical_track["events"] = sorted(events, key=_canonical)
+
+    blob = _canonical(canonical_track).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
 
 
 def replay(track, frame_times, handler):
@@ -176,7 +405,57 @@ def replay(track, frame_times, handler):
     supplied frame grid raise :class:`ReplayError` rather than being silently
     dropped.
     """
-    raise NotImplementedError("replay() is not implemented")
+    if not isinstance(track, dict):
+        raise ReplayError("track must be a mapping")
+    if not callable(handler):
+        raise ReplayError("handler must be callable")
+
+    events = track.get("events") or []
+    if not isinstance(events, (list, tuple)):
+        raise ReplayError("track events must be a list")
+    if not events:
+        return 0
+
+    frames = _validate_frame_times(frame_times)
+
+    by_frame = {}
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            raise ReplayError("each event must be a mapping")
+        frame = _event_frame_bounds(event, len(frames))
+        if not _is_int(event.get("t")):
+            raise ReplayError("event 't' must be an integer")
+        by_frame.setdefault(frame, []).append((index, event))
+
+    active_device = track.get("device")
+    delivered = 0
+
+    for frame in range(len(frames)):
+        # Stable sort by time; ties keep archive order.
+        batch = sorted(
+            by_frame.get(frame, ()),
+            key=lambda item: (item[1]["t"], item[0]),
+        )
+        for _, event in batch:
+            if event.get("type") == DEVICE_SWITCH:
+                payload = event.get("payload")
+                if isinstance(payload, dict) and "device_id" in payload:
+                    active_device = payload["device_id"]
+
+            copied = _copy_event(event)
+            copied["device"] = active_device
+            handler(copied)
+            delivered += 1
+
+    return delivered
+
+
+def _merge_conflict_key(event):
+    """Identity used to decide whether two events from different tracks clash."""
+    payload = event.get("payload")
+    if isinstance(payload, dict) and "key" in payload:
+        return (event["frame"], event["type"], "key", _canonical(payload["key"]))
+    return (event["frame"], event["type"], "payload", _canonical(payload))
 
 
 def merge_tracks(tracks):
@@ -200,4 +479,93 @@ def merge_tracks(tracks):
     ``"device": "merged"`` and the maximum input priority.  Inputs are not
     mutated.
     """
-    raise NotImplementedError("merge_tracks() is not implemented")
+    if not isinstance(tracks, (list, tuple)):
+        raise ReplayError("tracks must be a list of track mappings")
+
+    frames_per_track = []
+    for track in tracks:
+        if not isinstance(track, dict):
+            raise ReplayError("each track must be a mapping")
+        frames_per_track.append(
+            _validate_frame_times(track.get("frame_times") or [], require_any=False)
+        )
+
+    # Every input must agree on the common frame-time prefix, otherwise the
+    # same frame index would mean different times in different tracks.
+    for i in range(len(frames_per_track)):
+        for j in range(i + 1, len(frames_per_track)):
+            left = frames_per_track[i]
+            right = frames_per_track[j]
+            common = min(len(left), len(right))
+            if left[:common] != right[:common]:
+                raise ReplayError("tracks do not share a frame-time prefix")
+
+    union_times = sorted(
+        {frame_time for frames in frames_per_track for frame_time in frames}
+    )
+    union_index = {frame_time: index for index, frame_time in enumerate(union_times)}
+
+    priorities = []
+    for track in tracks:
+        priority = track.get("device_priority", 0)
+        if not _is_int(priority):
+            raise ReplayError("device_priority must be an integer")
+        priorities.append(priority)
+
+    entries = []
+    for track_index, (track, frames) in enumerate(zip(tracks, frames_per_track)):
+        events = track.get("events") or []
+        if not isinstance(events, (list, tuple)):
+            raise ReplayError("track events must be a list")
+        for event in events:
+            if not isinstance(event, dict):
+                raise ReplayError("each event must be a mapping")
+            frame = _event_frame_bounds(event, len(frames))
+            if not _is_int(event.get("t")):
+                raise ReplayError("event 't' must be an integer")
+            copied = _copy_event(event)
+            copied["frame"] = union_index[frames[frame]]
+            entries.append(
+                {
+                    "track": track_index,
+                    "order": len(entries),
+                    "event": copied,
+                }
+            )
+
+    # Resolve cross-track conflicts.  Events from the same track never
+    # conflict with one another; only the winning track's events survive.
+    groups = {}
+    for entry in entries:
+        key = _merge_conflict_key(entry["event"])
+        groups.setdefault(key, []).append(entry)
+
+    keep = set()
+    for group in groups.values():
+        track_numbers = {entry["track"] for entry in group}
+        if len(track_numbers) < 2:
+            keep.update(entry["order"] for entry in group)
+            continue
+
+        winner = min(
+            group,
+            key=lambda entry: (
+                -priorities[entry["track"]],
+                str(tracks[entry["track"]].get("device", "")),
+                entry["track"],
+            ),
+        )["track"]
+        keep.update(entry["order"] for entry in group if entry["track"] == winner)
+
+    merged_events = [
+        entry["event"] for entry in entries if entry["order"] in keep
+    ]
+    merged_events.sort(key=lambda event: (event["frame"], event["t"]))
+
+    return {
+        "frame_times": union_times,
+        "events": merged_events,
+        "truncated": any(bool(track.get("truncated", False)) for track in tracks),
+        "device": "merged",
+        "device_priority": max(priorities, default=0),
+    }
